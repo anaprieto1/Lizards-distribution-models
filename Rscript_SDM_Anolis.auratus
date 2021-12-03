@@ -1,0 +1,139 @@
+########## SDM for Anolis auratus in Colombia ##########
+
+library(raster)
+library(sp)
+library(dismo)
+library(biomod2)
+library(CoordinateCleaner)
+library(rJava)
+library(rgdal)
+library(usdm)
+
+
+###Preparing data###
+
+crop_poly<-shapefile("Colombia_polygon.shp")
+mywd<-getwd()
+
+##Get Climatic variables
+
+biovars<-getData('worldclim', var='bio', res=0.5, lat=4.58, lon=-74.06,)[[c(1,2,3,4,7,12,15)]] 
+bioclim<-crop(biovars, crop_poly)
+crs(bioclim)
+res(bioclim)
+ref_raster<-raster(bioclim)
+
+##Get observations
+
+occ<-read.csv("Anolis_auratus1.csv")
+occ_clean<-clean_coordinates(occ, "Longitud", "Latitud", species="Species", tests=c("equal", "zeros"), value="clean")
+occ_coord<-occ_clean[, c("Longitud", "Latitud")]
+occ_coord_single<-gridSample(occ_coord, ref_raster, n=1)
+occ_points<-SpatialPointsDataFrame(occ_coord_single, proj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"), data=occ_coord_single)
+writeOGR(occ_points, mywd, "occ_points", driver="ESRI Shapefile")
+
+## Test correlations and select among climatic variables
+
+cor.bioclim<-raster.cor.matrix(bioclim, method="spearman")
+write.csv(cor.bioclim, "cor.bioclim.csv")
+bioclim.subset<-dropLayer(bioclim, 3)
+
+## Get elevation data
+
+Elevation<-raster("Elev_mosaic_clip.tif")
+elevation<-crop(Elevation, crop_poly)
+crs(elevation)
+res(elevation)
+
+##Test correlations
+
+predictors<-addLayer(bioclim.subset, elevation)
+uncorr<-vifstep(predictors, th=4)
+uncorr_names<-as.character(uncorr@results$Variables)
+variables<-raster::subset(predictors, c(uncorr_names))
+
+
+###Modeling###
+
+##Organize data for models
+
+models<-c('GLM', 'GAM', 'MAXENT.Phillips')
+presence<- rep(1,dim(occ_points)[1])
+
+data<-BIOMOD_FormatingData(resp.var=presence, 
+                          expl.var=variables, 
+						  resp.xy=occ_coord_single, 
+						  resp.name="Anolis_auratus", 
+						  PA.nb.rep=3, 
+						  PA.nb.absences=2000, 
+						  PA.strategy='random', 
+						  PA.dist.min=0)
+
+models.options<-BIOMOD_ModelingOptions(GLM=list(type='quadratic', interaction.level=0), 
+                                      GAM=list(k=3), 
+									  MAXENT.Phillips=list(path_to_maxent.jar="c:/users/ana/Documents/R/win-library/4.1/dismo/java/maxent.jar", product=FALSE))
+
+
+##Built models
+
+model<-BIOMOD_Modeling(data=data, 
+                       models=models, 
+					   models.options=models.options, 
+					   NbRunEval=3, 
+					   DataSplit=70, 
+					   models.eval.meth=c('TSS', 'ROC'), 
+					   VarImport=3, 
+					   do.full.models=F, 
+					   modeling.id="MyModels")
+					   
+
+##Models evaluation and selection
+
+model.eval<-get_evaluations(model)
+models_scores_graph(model, by='models', metrics=c('ROC', 'TSS'), plot=TRUE)
+model.eval["TSS", "Testing.data", "MAXENT.Philips"]
+model@models.computed
+best.models<-model@models.computed[c(3,6,9,12,15,18,21,24,27)]
+
+##Variables importance
+
+var.imp<-drop(get_variables_importance(model))
+var.imp.table<- apply(var.imp, c(1,2), mean, na.rm=TRUE)
+barplot(height = t(var.imp.table), beside = TRUE, horiz = TRUE), xlab = "Variable Importance",legend = c("GLM", "GAM",  "MAXENT"))
+
+
+##Projection of best models
+
+model.projection<-BIOMOD_Projection(modeling.output=model,new.env=variables, proj.name='Anolis.proj', selected.models=best.models, binary.meth='TSS',
+                                    compress='xz', clamping.mask='F', output.format='.grd')
+plot(model.projection)
+plot(model.projection, str.grep = 'PA3_RUN1_MAXENT.Phillips')
+
+
+##Built Ensemble model
+
+model.ensemble<-BIOMOD_EnsembleModeling(modeling.output=model,
+                                        chosen.models=best.models,
+										em.by='all',
+										eval.metric=c('TSS'),
+										eval.metric.quality.threshold=c(0.5),
+										prob.mean=TRUE,
+										prob.mean.weight=FALSE,
+										prob.cv=TRUE,
+										prob.ci=TRUE,
+										committee.averaging=TRUE)
+
+get_evaluations(model.ensemble)
+										
+
+##Project ensemble model 
+
+ensemble.projection<-BIOMOD_EnsembleForecasting(EM.output=model.ensemble, 
+                                                projection.output= model.projection, 
+												binary=TRUE,
+												binary.meth='TSS', 
+												proj.name='Anolis.ensemble', 
+												compress='xz')											
+
+plot(ensemble.projection)
+plot(ensemble.projection, str.grep='Anolis.auratus_EMmeanByTSS_MAXENT.Phillips_mergedRun_mergedData')
